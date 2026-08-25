@@ -1,79 +1,70 @@
 import { Device } from "./device.js";
+import { StorageError } from "./errors.js";
 
+/**
+ * Central device registry.
+ *
+ * Register devices by name once at startup, then resolve them anywhere
+ * in the application via `Storage.getDevice`.
+ */
 export class Storage {
-  /**
-   * Supported devices
-   */
   static readonly DEVICE_LOCAL = "local";
   static readonly DEVICE_S3 = "s3";
-  // static readonly DEVICE_DO_SPACES = 'dospaces';
   static readonly DEVICE_WASABI = "wasabi";
   static readonly DEVICE_MINIO = "minio";
-  // static readonly DEVICE_BACKBLAZE = 'backblaze';
-  // static readonly DEVICE_LINODE = 'linode';
 
-  /**
-   * Devices.
-   *
-   * List of all available storage devices
-   */
   private static devices: Map<string, Device> = new Map();
 
   /**
-   * Set Device.
-   *
-   * Add device by name
-   *
-   * @param name
-   * @param device
-   * @throws Error
+   * Register a device under a name (replaces any existing registration).
    */
   static setDevice(name: string, device: Device): void {
     this.devices.set(name, device);
   }
 
   /**
-   * Get Device.
-   *
-   * Get device by name
-   *
-   * @param name
-   * @returns Device
-   * @throws Error
+   * Get a registered device by name.
+   * @throws StorageError with code `DEVICE_NOT_FOUND` when missing.
    */
   static getDevice(name: string): Device {
-    if (!this.devices.has(name)) {
-      throw new Error(`The device "${name}" is not listed`);
+    const device = this.devices.get(name);
+    if (!device) {
+      throw new StorageError("DEVICE_NOT_FOUND", `The device "${name}" is not listed`, name);
     }
-
-    return this.devices.get(name)!;
+    return device;
   }
 
   /**
-   * Exists.
-   *
-   * Checks if given storage name is registered or not
-   *
-   * @param name
-   * @returns boolean
+   * Check whether a device name is registered.
    */
   static exists(name: string): boolean {
     return this.devices.has(name);
   }
 
   /**
-   * Human readable data size format from bytes input.
+   * Unregister a device. Returns true if it was registered.
+   */
+  static removeDevice(name: string): boolean {
+    return this.devices.delete(name);
+  }
+
+  /**
+   * Names of all registered devices.
+   */
+  static listDevices(): string[] {
+    return [...this.devices.keys()];
+  }
+
+  /**
+   * Format bytes as a human-readable size string.
    *
-   * Based on: https://stackoverflow.com/a/38659168/2299554
-   *
-   * @param bytes
-   * @param decimals
-   * @param system
-   * @returns string
+   * @example
+   * Storage.human(1024);              // "1.00kB"  (metric)
+   * Storage.human(1024, 2, "binary"); // "1.00KiB"
    */
   static human(
     bytes: number,
-    decimals: number = 2,
+    decimals = 2,
     system: "binary" | "metric" = "metric",
   ): string {
     const mod = system === "binary" ? 1024 : 1000;

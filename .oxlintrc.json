@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "perf": "warn",
+    "suspicious": "warn"
+  },
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "env": {
+    "builtin": true,
+    "es2024": true
+  },
+  "globals": {
+    "Bun": "readonly"
+  },
+  "rules": {
+    "no-unused-vars": "warn",
+    "typescript/no-explicit-any": "off",
+    "eqeqeq": "error",
+    "no-var": "error",
+    "prefer-const": "error"
+  },
+  "ignorePatterns": ["dist", "node_modules", "coverage", "*.d.ts"]
+}

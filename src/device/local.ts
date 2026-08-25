@@ -1,14 +1,20 @@
-import { Device } from "../device.js";
+import { mkdir, readdir, rm, statfs } from "node:fs/promises";
+import path from "node:path";
+import { Device, DeviceMetadata, FileEntry, FileStat } from "../device.js";
+import { StorageError } from "../errors.js";
 import { Storage } from "../storage.js";
-import { promises as fs } from "fs";
-import path from "path";
-import { createHash } from "crypto";
 
+const PART_MARKER = ".part.";
+
+/**
+ * Local filesystem storage device built on Bun's native file APIs
+ * (`Bun.file`, `Bun.write`). Directory operations use Bun's built-in
+ * Node-compatible `node:fs` module.
+ */
 export class Local extends Device {
-  protected root: string = "temp";
-  protected readonly MAX_PAGE_SIZE = 1000;
+  protected root: string;
 
-  constructor(root: string = "") {
+  constructor(root = "") {
     super();
     this.root = root;
   }
@@ -22,332 +28,203 @@ export class Local extends Device {
   }
 
   getDescription(): string {
-    return "Adapter for Local storage that is in the physical or virtual machine or mounted to it.";
+    return "Adapter for local storage on the physical or virtual machine, or mounted to it.";
   }
 
   getRoot(): string {
     return this.root;
   }
 
-  getPath(filename: string, prefix?: string): string {
-    return this.getAbsolutePath(path.join(this.getRoot(), filename));
+  getPath(filename: string, _prefix?: string): string {
+    return this.getAbsolutePath(path.join(this.root, filename));
   }
 
   async upload(
     source: string,
     filePath: string,
-    chunk: number = 1,
-    chunks: number = 1,
-    metadata: Record<string, any> = {},
+    chunk = 1,
+    chunks = 1,
+    _metadata: DeviceMetadata = {},
   ): Promise<number> {
-    await this.createDirectory(path.dirname(filePath));
-
-    if (chunks === 1) {
+    if (chunks <= 1) {
+      await this.createDirectory(path.dirname(filePath));
       try {
-        await fs.rename(source, filePath);
-        return chunks;
+        await this.rename(source, filePath);
+        return 1;
       } catch {
-        throw new Error(`Can't upload file ${filePath}`);
+        throw new StorageError("UPLOAD_FAILED", `Can't upload file ${filePath}`, filePath);
       }
     }
 
-    const tmp = path.join(
-      path.dirname(filePath),
-      `tmp_${path.basename(filePath)}`,
-      `${path.basename(filePath)}_chunks.log`,
-    );
-    await this.createDirectory(path.dirname(tmp));
+    const stagingDir = stagingDirFor(filePath);
+    await this.createDirectory(stagingDir);
 
-    const chunkFilePath = path.join(
-      path.dirname(tmp),
-      `${path.parse(filePath).name}.part.${chunk}`,
-    );
-
-    if (!(await this.exists(chunkFilePath))) {
-      try {
-        await fs.appendFile(tmp, `${chunk}\n`);
-      } catch {
-        throw new Error(`Can't write chunk log ${tmp}`);
-      }
-    }
-
+    const partPath = partPathFor(filePath, chunk);
     try {
-      const chunkLogs = await fs.readFile(tmp, "utf8");
-      const chunksReceived = chunkLogs.trim().split("\n").length;
-
-      await fs.rename(source, chunkFilePath);
-
-      if (chunks === chunksReceived) {
-        await this.joinChunks(filePath, chunks);
-        return chunksReceived;
-      }
-
-      return chunksReceived;
+      await this.rename(source, partPath);
     } catch {
-      throw new Error(`Failed to write chunk ${chunk}`);
+      throw new StorageError("UPLOAD_FAILED", `Failed to write chunk ${chunk}`, filePath);
     }
+
+    const received = (await this.listParts(filePath)).length;
+
+    if (received === chunks) {
+      await this.joinChunks(filePath, chunks);
+    }
+
+    return received;
   }
 
   async uploadData(
     data: string | Buffer,
     filePath: string,
-    contentType: string,
-    chunk: number = 1,
-    chunks: number = 1,
-    metadata: Record<string, any> = {},
+    _contentType: string,
+    chunk = 1,
+    chunks = 1,
+    _metadata: DeviceMetadata = {},
   ): Promise<number> {
-    await this.createDirectory(path.dirname(filePath));
-
-    if (chunks === 1) {
-      try {
-        await fs.writeFile(filePath, data);
-        return chunks;
-      } catch {
-        throw new Error(`Can't write file ${filePath}`);
-      }
+    if (chunks <= 1) {
+      return (await this.write(filePath, data)) ? 1 : 0;
     }
 
-    const tmp = path.join(
-      path.dirname(filePath),
-      `tmp_${path.basename(filePath)}`,
-      `${path.basename(filePath)}_chunks.log`,
-    );
-    await this.createDirectory(path.dirname(tmp));
+    const stagingDir = stagingDirFor(filePath);
+    await this.createDirectory(stagingDir);
 
     try {
-      await fs.appendFile(tmp, `${chunk}\n`);
-      const chunkLogs = await fs.readFile(tmp, "utf8");
-      const chunksReceived = chunkLogs.trim().split("\n").length;
-
-      const chunkFilePath = path.join(
-        path.dirname(tmp),
-        `${path.parse(filePath).name}.part.${chunk}`,
-      );
-      await fs.writeFile(chunkFilePath, data);
-
-      if (chunks === chunksReceived) {
-        await this.joinChunks(filePath, chunks);
-        return chunksReceived;
-      }
-
-      return chunksReceived;
+      await Bun.write(partPathFor(filePath, chunk), data);
     } catch {
-      throw new Error(`Failed to write chunk ${chunk}`);
+      throw new StorageError("UPLOAD_FAILED", `Failed to write chunk ${chunk}`, filePath);
     }
+
+    const received = (await this.listParts(filePath)).length;
+
+    if (received === chunks) {
+      await this.joinChunks(filePath, chunks);
+    }
+
+    return received;
   }
 
-  private async joinChunks(filePath: string, chunks: number): Promise<void> {
-    const tmp = path.join(
-      path.dirname(filePath),
-      `tmp_${path.basename(filePath)}`,
-      `${path.basename(filePath)}_chunks.log`,
-    );
+  /**
+   * Abort a chunked upload: remove staged parts and any partial target.
+   */
+  async abort(filePath: string, _extra = ""): Promise<boolean> {
+    const stagingDir = stagingDirFor(filePath);
 
-    for (let i = 1; i <= chunks; i++) {
-      const part = path.join(
-        path.dirname(tmp),
-        `${path.parse(filePath).name}.part.${i}`,
-      );
-
-      try {
-        const data = await fs.readFile(part);
-        await fs.appendFile(filePath, data);
-        await fs.unlink(part);
-      } catch {
-        throw new Error(`Failed to read/append chunk ${part}`);
-      }
+    if (await Bun.file(filePath).exists()) {
+      await Bun.file(filePath).delete();
     }
 
-    await fs.unlink(tmp);
-    await fs.rmdir(path.dirname(tmp));
-  }
-
-  async transfer(
-    filePath: string,
-    destination: string,
-    device: Device,
-  ): Promise<boolean> {
-    if (!(await this.exists(filePath))) {
-      throw new Error("File Not Found");
+    if (!(await isDirectory(stagingDir))) {
+      throw new StorageError("FILE_NOT_FOUND", `No staged upload for ${filePath}`, filePath);
     }
 
-    const size = await this.getFileSize(filePath);
-    const contentType = await this.getFileMimeType(filePath);
-
-    if (size <= this.transferChunkSize) {
-      const source = await this.read(filePath);
-      return await device.write(destination, source, contentType);
-    }
-
-    const totalChunks = Math.ceil(size / this.transferChunkSize);
-    const metadata = { content_type: contentType };
-
-    for (let counter = 0; counter < totalChunks; counter++) {
-      const start = counter * this.transferChunkSize;
-      const data = await this.read(filePath, start, this.transferChunkSize);
-      await device.uploadData(
-        data,
-        destination,
-        contentType,
-        counter + 1,
-        totalChunks,
-        metadata,
-      );
-    }
-
+    await rm(stagingDir, { recursive: true, force: true });
     return true;
   }
 
-  async abort(filePath: string, extra: string = ""): Promise<boolean> {
-    if (await this.exists(filePath)) {
-      await fs.unlink(filePath);
+  async read(filePath: string, offset = 0, length?: number): Promise<Buffer> {
+    const file = Bun.file(filePath);
+
+    if (!(await file.exists())) {
+      throw new StorageError("FILE_NOT_FOUND", `File not found: ${filePath}`, filePath);
     }
 
-    const tmp = path.join(
-      path.dirname(filePath),
-      `tmp_${path.basename(filePath)}`,
-    );
+    const sliced =
+      length === undefined ? (offset > 0 ? file.slice(offset) : file) : file.slice(offset, offset + length);
 
-    if (!(await this.exists(path.dirname(tmp)))) {
-      throw new Error(`File doesn't exist: ${path.dirname(filePath)}`);
-    }
-
-    const files = await this.getFiles(tmp);
-    for (const file of files) {
-      await this.delete(file, true);
-    }
-
-    return fs
-      .rmdir(tmp)
-      .then(() => true)
-      .catch(() => false);
+    return Buffer.from(await sliced.arrayBuffer());
   }
 
-  async read(
-    filePath: string,
-    offset: number = 0,
-    length?: number,
-  ): Promise<Buffer> {
-    if (!(await this.exists(filePath))) {
-      throw new Error("File Not Found");
-    }
-
-    const fileHandle = await fs.open(filePath, "r");
-    try {
-      const size = length ?? (await fileHandle.stat()).size - offset;
-      const buffer = Buffer.alloc(size);
-      await fileHandle.read(buffer, 0, size, offset);
-      return buffer;
-    } finally {
-      await fileHandle.close();
-    }
-  }
-
-  async write(
-    filePath: string,
-    data: string | Buffer,
-    contentType: string = "",
-  ): Promise<boolean> {
+  async write(filePath: string, data: string | Buffer, _contentType = ""): Promise<boolean> {
     try {
       await this.createDirectory(path.dirname(filePath));
-      await fs.writeFile(filePath, data);
+      await Bun.write(Bun.file(filePath), data);
       return true;
     } catch {
-      throw new Error(`Can't write to path ${filePath}`);
+      throw new StorageError("WRITE_FAILED", `Can't write to path ${filePath}`, filePath);
     }
   }
 
+  /**
+   * Move a file within the local device using an atomic rename.
+   */
   async move(source: string, target: string): Promise<boolean> {
-    if (source === target) {
+    if (source === target || !(await exists(source))) {
       return false;
     }
-
     try {
       await this.createDirectory(path.dirname(target));
-      await fs.rename(source, target);
+      await this.rename(source, target);
       return true;
     } catch {
       return false;
     }
   }
 
-  async delete(filePath: string, recursive: boolean = false): Promise<boolean> {
+  async delete(filePath: string, recursive = false): Promise<boolean> {
     try {
-      const stats = await fs.stat(filePath);
-
-      if (stats.isDirectory() && recursive) {
-        const files = await this.getFiles(filePath);
-        for (const file of files) {
-          await this.delete(file, true);
-        }
-        await fs.rmdir(filePath);
-      } else if (stats.isFile() || stats.isSymbolicLink()) {
-        await fs.unlink(filePath);
+      const file = Bun.file(filePath);
+      if (await file.exists()) {
+        await file.delete();
+        return true;
       }
-
-      return true;
+      // Not a regular file — maybe a directory.
+      if (recursive && (await isDirectory(filePath))) {
+        await rm(filePath, { recursive: true });
+        return true;
+      }
+      return false;
     } catch {
       return false;
     }
   }
 
   async deletePath(filePath: string): Promise<boolean> {
-    const fullPath = path.resolve(path.join(this.getRoot(), filePath));
-
-    try {
-      if (!(await this.exists(fullPath))) {
-        return false;
-      }
-
-      const stats = await fs.stat(fullPath);
-      if (!stats.isDirectory()) {
-        return false;
-      }
-
-      const files = await this.getFiles(fullPath);
-      for (const file of files) {
-        const stats = await fs.stat(file);
-        if (stats.isDirectory()) {
-          const relativePath = file.replace(this.getRoot() + path.sep, "");
-          await this.deletePath(relativePath);
-        } else {
-          await this.delete(file, true);
-        }
-      }
-
-      await fs.rmdir(fullPath);
-      return true;
-    } catch {
+    if (!(await isDirectory(filePath))) {
       return false;
     }
+    await rm(filePath, { recursive: true, force: true });
+    return true;
   }
 
   async exists(filePath: string): Promise<boolean> {
-    try {
-      await fs.access(filePath);
-      return true;
-    } catch {
-      return false;
-    }
+    return Bun.file(filePath).exists();
   }
 
   async getFileSize(filePath: string): Promise<number> {
-    const stats = await fs.stat(filePath);
-    return stats.size;
+    const size = Bun.file(filePath).size;
+    if (size === -1 && !(await Bun.file(filePath).exists())) {
+      throw new StorageError("FILE_NOT_FOUND", `File not found: ${filePath}`, filePath);
+    }
+    return size;
   }
 
   async getFileMimeType(filePath: string): Promise<string> {
-    return this.getMimeType(filePath);
+    // Bun detects MIME from content magic bytes + extension.
+    return stripCharset(Bun.file(filePath).type);
   }
 
   async getFileHash(filePath: string): Promise<string> {
-    const data = await fs.readFile(filePath);
-    return createHash("md5").update(data).digest("hex");
+    const hasher = new Bun.CryptoHasher("md5");
+    hasher.update(await Bun.file(filePath).bytes());
+    return hasher.digest("hex");
+  }
+
+  async stat(filePath: string): Promise<FileStat> {
+    const file = Bun.file(filePath);
+    if (!(await file.exists())) {
+      throw new StorageError("FILE_NOT_FOUND", `File not found: ${filePath}`, filePath);
+    }
+    return {
+      size: file.size,
+      mimeType: stripCharset(file.type),
+    };
   }
 
   async createDirectory(dirPath: string): Promise<boolean> {
     try {
-      await fs.mkdir(dirPath, { recursive: true, mode: 0o755 });
+      await mkdir(dirPath, { recursive: true, mode: 0o755 });
       return true;
     } catch {
       return false;
@@ -355,48 +232,108 @@ export class Local extends Device {
   }
 
   async getDirectorySize(dirPath: string): Promise<number> {
+    let total = 0;
+    let entries: FileEntry[];
+
     try {
-      let size = 0;
-      const files = await fs.readdir(dirPath, { withFileTypes: true });
-
-      for (const file of files) {
-        if (file.name.startsWith(".")) continue;
-
-        const fullPath = path.join(dirPath, file.name);
-        if (file.isDirectory()) {
-          size += await this.getDirectorySize(fullPath);
-        } else {
-          const stats = await fs.stat(fullPath);
-          size += stats.size;
-        }
-      }
-
-      return size;
+      entries = await this.getFiles(dirPath);
     } catch {
       return -1;
     }
+
+    for (const entry of entries) {
+      if (await isDirectory(entry.key)) {
+        total += await this.getDirectorySize(entry.key);
+      } else {
+        total += Bun.file(entry.key).size;
+      }
+    }
+
+    return total;
   }
 
   async getPartitionFreeSpace(): Promise<number> {
-    const stats = await fs.statfs(this.getRoot());
+    const stats = await statfs(this.root || ".");
     return stats.bavail * stats.bsize;
   }
 
   async getPartitionTotalSpace(): Promise<number> {
-    const stats = await fs.statfs(this.getRoot());
+    const stats = await statfs(this.root || ".");
     return stats.blocks * stats.bsize;
   }
 
-  async getFiles(
-    dir: string,
-    max: number = this.MAX_PAGE_SIZE,
-    continuationToken: string = "",
-  ): Promise<string[]> {
+  async getFiles(dir: string): Promise<FileEntry[]> {
     try {
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      return entries.map((entry) => path.join(dir, entry.name));
+      const entries = await readdir(dir, { withFileTypes: true });
+      return entries.map((entry) => ({
+        key: path.join(dir, entry.name),
+        size: entry.isFile() ? Bun.file(path.join(dir, entry.name)).size : undefined,
+      }));
     } catch {
       return [];
     }
   }
+
+  /**
+   * Concatenate staged parts into the final file and clean up.
+   */
+  private async joinChunks(filePath: string, chunks: number): Promise<void> {
+    const target = Bun.file(filePath);
+    const writer = target.writer();
+
+    for (let i = 1; i <= chunks; i++) {
+      const partPath = partPathFor(filePath, i);
+      writer.write(await Bun.file(partPath).bytes());
+    }
+    await writer.end();
+
+    await rm(stagingDirFor(filePath), { recursive: true, force: true });
+  }
+
+  /**
+   * Count staged part files for a target path.
+   */
+  private async listParts(filePath: string): Promise<string[]> {
+    const stagingDir = stagingDirFor(filePath);
+    const prefix = `${path.parse(filePath).name}${PART_MARKER}`;
+
+    try {
+      const entries = await readdir(stagingDir);
+      return entries.filter((entry) => entry.startsWith(prefix));
+    } catch {
+      return [];
+    }
+  }
+
+  private async rename(source: string, target: string): Promise<void> {
+    await import("node:fs").then((fs) => fs.promises.rename(source, target));
+  }
+}
+
+function stagingDirFor(filePath: string): string {
+  return path.join(path.dirname(filePath), `tmp_${path.basename(filePath)}`);
+}
+
+function partPathFor(filePath: string, chunk: number): string {
+  return path.join(
+    stagingDirFor(filePath),
+    `${path.parse(filePath).name}${PART_MARKER}${chunk}`,
+  );
+}
+
+async function exists(p: string): Promise<boolean> {
+  return Bun.file(p).exists();
+}
+
+async function isDirectory(p: string): Promise<boolean> {
+  try {
+    const { stat } = await import("node:fs/promises");
+    return (await stat(p)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function stripCharset(type: string): string {
+  return type.split(";")[0]?.trim() ?? "";
 }

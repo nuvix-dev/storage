@@ -1,82 +1,53 @@
+import { describe, test, expect } from "bun:test";
 import { MinIO } from "../../src/device/minio";
+import { S3 } from "../../src/device/s3";
 import { Storage } from "../../src/storage";
 
-describe("MinIO", () => {
-  let minio: MinIO;
+const baseOptions = {
+  accessKeyId: "minioadmin",
+  secretAccessKey: "minioadmin",
+  bucket: "test-bucket",
+};
 
-  beforeEach(() => {
-    minio = new MinIO(
-      "test-root",
-      "minioadmin",
-      "minioadmin",
-      "test-bucket",
-      "localhost:9000",
-      MinIO.ACL_PRIVATE,
-      false,
-    );
+describe("MinIO Device", () => {
+  test("reports MinIO metadata", () => {
+    const device = new MinIO(baseOptions);
+    expect(device.getName()).toBe("MinIO Storage");
+    expect(device.getType()).toBe(Storage.DEVICE_MINIO);
+    expect(device.getDescription()).toContain("MinIO");
   });
 
-  test("getName() should return MinIO Storage", () => {
-    expect(minio.getName()).toBe("MinIO Storage");
+  test("uses path-style URLs against the local endpoint over HTTP by default", () => {
+    const device = new MinIO(baseOptions);
+    const url = device.presign("file.txt");
+
+    expect(url.startsWith("http://localhost:9000/test-bucket/")).toBe(true);
+    expect(url).toContain("X-Amz-Signature=");
   });
 
-  test("getType() should return correct device type", () => {
-    expect(minio.getType()).toBe(Storage.DEVICE_MINIO);
+  test("supports useSSL", () => {
+    const device = new MinIO({ ...baseOptions, endpoint: "play.min.io", useSSL: true });
+    const url = device.presign("file.txt");
+
+    expect(url.startsWith("https://play.min.io/test-bucket/")).toBe(true);
   });
 
-  test("getDescription() should return correct description", () => {
-    expect(minio.getDescription()).toBe(
-      "MinIO S3-compatible object storage server",
-    );
+  test("strips protocol prefixes from the endpoint", () => {
+    const device = new MinIO({ ...baseOptions, endpoint: "https://play.min.io", useSSL: true });
+    const url = device.presign("file.txt");
+
+    expect(url.startsWith("https://play.min.io/test-bucket/")).toBe(true);
   });
 
-  test("getRoot() should return the root path", () => {
-    expect(minio.getRoot()).toBe("test-root");
+  test("defaults to us-east-1 region (SigV4 requirement)", () => {
+    const device = new MinIO(baseOptions);
+    const url = device.presign("file.txt");
+
+    expect(url).toContain("X-Amz-Credential=minioadmin%2F");
+    expect(url).toContain("us-east-1");
   });
 
-  test("constructor should set correct host for HTTP", () => {
-    const minioHttp = new MinIO(
-      "test-root",
-      "minioadmin",
-      "minioadmin",
-      "test-bucket",
-      "localhost:9000",
-      MinIO.ACL_PRIVATE,
-      false,
-    );
-
-    // Access the protected headers property for testing
-    const headers = (minioHttp as any).headers;
-    expect(headers["host"]).toBe("test-bucket.localhost:9000");
-  });
-
-  test("constructor should set correct host for HTTPS", () => {
-    const minioHttps = new MinIO(
-      "test-root",
-      "minioadmin",
-      "minioadmin",
-      "test-bucket",
-      "play.min.io",
-      MinIO.ACL_PRIVATE,
-      true,
-    );
-
-    const headers = (minioHttps as any).headers;
-    expect(headers["host"]).toBe("test-bucket.play.min.io");
-  });
-
-  test("constructor should handle endpoint with protocol", () => {
-    const minioWithProtocol = new MinIO(
-      "test-root",
-      "minioadmin",
-      "minioadmin",
-      "test-bucket",
-      "https://play.min.io",
-      MinIO.ACL_PRIVATE,
-      true,
-    );
-
-    const headers = (minioWithProtocol as any).headers;
-    expect(headers["host"]).toBe("test-bucket.play.min.io");
+  test("inherits S3 ACL constants", () => {
+    expect(MinIO.ACL_PUBLIC_READ).toBe(S3.ACL_PUBLIC_READ);
   });
 });

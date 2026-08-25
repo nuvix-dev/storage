@@ -1,72 +1,81 @@
-export interface DeviceMetadata {
-  [key: string]: any;
+import { StorageError } from "./errors.js";
+
+/**
+ * Arbitrary key/value metadata carried across chunked upload calls.
+ */
+export type DeviceMetadata = Record<string, unknown>;
+
+/**
+ * Stat information for a stored file.
+ */
+export interface FileStat {
+  size: number;
+  mimeType: string;
+  etag?: string;
+  lastModified?: Date;
 }
 
+/**
+ * A single entry returned by `getFiles`.
+ */
+export interface FileEntry {
+  key: string;
+  size?: number;
+  lastModified?: Date;
+  etag?: string;
+}
+
+/**
+ * Options accepted by `presign` where supported.
+ */
+export interface PresignOptions {
+  expiresIn?: number;
+  method?: "GET" | "POST" | "PUT" | "DELETE" | "HEAD";
+  acl?: string;
+  type?: string;
+}
+
+/**
+ * Abstract storage device.
+ *
+ * Every backend (local disk, S3, Wasabi, MinIO, ...) implements this contract,
+ * so callers can swap devices without changing application code.
+ */
 export abstract class Device {
   /**
-   * Max chunk size while transferring file from one device to another
+   * Max chunk size while transferring a file from one device to another.
    */
-  protected transferChunkSize: number = 20000000; // 20 MB
+  protected transferChunkSize = 20_000_000; // 20 MB
 
   /**
-   * Sets the maximum number of keys returned to the response. By default, the action returns up to 1,000 key names.
-   */
-  protected static readonly MAX_PAGE_SIZE: number = Number.MAX_SAFE_INTEGER;
-
-  /**
-   * Set Transfer Chunk Size
+   * Set the maximum chunk size used by `transfer`.
    */
   public setTransferChunkSize(chunkSize: number): void {
     this.transferChunkSize = chunkSize;
   }
 
-  /**
-   * Get Transfer Chunk Size
-   */
   public getTransferChunkSize(): number {
     return this.transferChunkSize;
   }
 
-  /**
-   * Get Name.
-   *
-   * Get storage device name
-   */
+  /** Storage device name. */
   abstract getName(): string;
 
-  /**
-   * Get Type.
-   *
-   * Get storage device type
-   */
+  /** Storage device type (one of `Storage.DEVICE_*`). */
   abstract getType(): string;
 
-  /**
-   * Get Description.
-   *
-   * Get storage device description and purpose.
-   */
+  /** Human-readable description of the device. */
   abstract getDescription(): string;
 
-  /**
-   * Get Root.
-   *
-   * Get storage device root path
-   */
+  /** Root path/prefix under which all files are stored. */
   abstract getRoot(): string;
 
-  /**
-   * Get Path.
-   *
-   * Each device hold a complex directory structure that is being build in this method.
-   */
+  /** Build the full internal path for a filename. */
   abstract getPath(filename: string, prefix?: string): string;
 
   /**
-   * Upload.
-   *
-   * Upload a file to desired destination in the selected disk
-   * return number of chunks uploaded or 0 if it fails.
+   * Upload a local file to the given path.
+   * Returns the number of chunks written, or 0 on failure.
    */
   abstract upload(
     source: string,
@@ -77,10 +86,8 @@ export abstract class Device {
   ): Promise<number>;
 
   /**
-   * Upload Data.
-   *
-   * Upload file contents to desired destination in the selected disk.
-   * return number of chunks uploaded or 0 if it fails.
+   * Upload raw data to the given path.
+   * Returns the number of chunks written, or 0 on failure.
    */
   abstract uploadData(
     data: string | Buffer,
@@ -91,125 +98,127 @@ export abstract class Device {
     metadata?: DeviceMetadata,
   ): Promise<number>;
 
-  /**
-   * Abort Chunked Upload
-   */
+  /** Abort an in-progress chunked upload and clean staged parts. */
   abstract abort(path: string, extra?: string): Promise<boolean>;
 
-  /**
-   * Read file by given path.
-   */
-  abstract read(
-    path: string,
-    offset?: number,
-    length?: number,
-  ): Promise<Buffer>;
+  /** Read a file (optionally a byte range) into memory. */
+  abstract read(path: string, offset?: number, length?: number): Promise<Buffer>;
 
-  /**
-   * Transfer
-   * Transfer a file from current device to destination device.
-   */
-  abstract transfer(
-    path: string,
-    destination: string,
-    device: Device,
-  ): Promise<boolean>;
-
-  /**
-   * Write file by given path.
-   */
+  /** Write data to a path. Throws `StorageError` on failure. */
   abstract write(
     path: string,
     data: string | Buffer,
-    contentType: string,
+    contentType?: string,
   ): Promise<boolean>;
 
   /**
-   * Move file from given source to given path, return true on success and false on failure.
+   * Transfer a file from this device to another device.
+   * Files larger than `transferChunkSize` are streamed in chunks.
+   */
+  public async transfer(
+    filePath: string,
+    destination: string,
+    device: Device,
+  ): Promise<boolean> {
+    if (!(await this.exists(filePath))) {
+      throw new StorageError("FILE_NOT_FOUND", `File not found: ${filePath}`, filePath);
+    }
+
+    const size = await this.getFileSize(filePath);
+    const contentType = await this.getFileMimeType(filePath);
+
+    if (size <= this.transferChunkSize) {
+      return device.write(destination, await this.read(filePath), contentType);
+    }
+
+    const totalChunks = Math.ceil(size / this.transferChunkSize);
+    const metadata: DeviceMetadata = {};
+
+    for (let counter = 0; counter < totalChunks; counter++) {
+      const data = await this.read(
+        filePath,
+        counter * this.transferChunkSize,
+        this.transferChunkSize,
+      );
+      await device.uploadData(
+        data,
+        destination,
+        contentType,
+        counter + 1,
+        totalChunks,
+        metadata,
+      );
+    }
+
+    return true;
+  }
+
+  /**
+   * Move a file within this device: transfer then delete the source.
    */
   public async move(source: string, target: string): Promise<boolean> {
     if (source === target) {
       return false;
     }
-
-    if (await this.transfer(source, target, this)) {
-      return await this.delete(source);
+    if (!(await this.exists(source))) {
+      return false;
     }
-
+    if (await this.transfer(source, target, this)) {
+      return this.delete(source);
+    }
     return false;
   }
 
-  /**
-   * Delete file in given path return true on success and false on failure.
-   */
+  /** Delete a file (or directory when `recursive`). */
   abstract delete(path: string, recursive?: boolean): Promise<boolean>;
 
-  /**
-   * Delete files in given path, path must be a directory. return true on success and false on failure.
-   */
+  /** Delete everything under a directory path. */
   abstract deletePath(path: string): Promise<boolean>;
 
-  /**
-   * Check if file exists
-   */
+  /** Check whether a file exists. */
   abstract exists(path: string): Promise<boolean>;
 
-  /**
-   * Returns given file path its size.
-   */
+  /** Get file size in bytes. */
   abstract getFileSize(path: string): Promise<number>;
 
-  /**
-   * Returns given file path its mime type.
-   */
+  /** Get file MIME type. */
   abstract getFileMimeType(path: string): Promise<string>;
 
-  /**
-   * Returns given file path its MD5 hash value.
-   */
+  /** Get file MD5 hash as hex string. */
   abstract getFileHash(path: string): Promise<string>;
 
+  /** Get size, MIME type and (when available) ETag in one call. */
+  abstract stat(path: string): Promise<FileStat>;
+
   /**
-   * Create a directory at the specified path.
-   *
-   * Returns true on success or if the directory already exists and false on error
+   * Generate a presigned URL for temporary access.
+   * Only supported by cloud devices; throws `UNSUPPORTED_OPERATION` otherwise.
    */
+  public presign(_path: string, _options?: PresignOptions): string {
+    throw new StorageError(
+      "UNSUPPORTED_OPERATION",
+      `${this.getName()} does not support presigned URLs`,
+    );
+  }
+
+  /** Create a directory (recursive). Returns true on success or if it exists. */
   abstract createDirectory(path: string): Promise<boolean>;
 
-  /**
-   * Get directory size in bytes.
-   *
-   * Return -1 on error
-   */
+  /** Total size in bytes of all files under a directory. -1 on error. */
   abstract getDirectorySize(path: string): Promise<number>;
 
-  /**
-   * Get Partition Free Space.
-   *
-   * Returns available space on filesystem or disk partition
-   */
+  /** Free space on the backing partition. -1 when not applicable. */
   abstract getPartitionFreeSpace(): Promise<number>;
 
-  /**
-   * Get Partition Total Space.
-   *
-   * Returns the total size of a filesystem or disk partition
-   */
+  /** Total space on the backing partition. -1 when not applicable. */
   abstract getPartitionTotalSpace(): Promise<number>;
 
-  /**
-   * Get all files and directories inside a directory.
-   */
-  abstract getFiles(
-    dir: string,
-    max?: number,
-    continuationToken?: string,
-  ): Promise<any[]>;
+  /** List files under a directory, paginated where the backend supports it. */
+  abstract getFiles(dir: string, max?: number, continuationToken?: string): Promise<FileEntry[]>;
 
   /**
-   * Get the absolute path by resolving strings like ../, .., //, /\ and so on.
-   *
-   * Works like the realpath function but works on files that does not exist
+   * Resolve `../`, `.`, duplicate and mixed separators to a canonical
+   * absolute-looking path. Works on paths that do not exist yet.
    */
   public getAbsolutePath(path: string): string {
     const normalizedPath = path.replace(/[/\\]/g, "/");
@@ -217,9 +226,7 @@ export abstract class Device {
 
     const absolutes: string[] = [];
     for (const part of parts) {
-      if (part === ".") {
-        continue;
-      }
+      if (part === ".") continue;
       if (part === "..") {
         absolutes.pop();
       } else {
@@ -228,75 +235,5 @@ export abstract class Device {
     }
 
     return "/" + absolutes.join("/");
-  }
-
-  protected async getMimeType(filePath: string): Promise<string> {
-    const path = await import("path");
-
-    // Node.js doesn't have a built-in MIME type module, so we'll use a comprehensive mapping
-    const ext = path.extname(filePath).toLowerCase().slice(1);
-    const mimeTypes: Record<string, string> = {
-      // Text
-      txt: "text/plain",
-      html: "text/html",
-      htm: "text/html",
-      css: "text/css",
-      csv: "text/csv",
-      xml: "text/xml",
-
-      // JavaScript
-      js: "application/javascript",
-      mjs: "application/javascript",
-      json: "application/json",
-
-      // Images
-      png: "image/png",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      gif: "image/gif",
-      svg: "image/svg+xml",
-      webp: "image/webp",
-      ico: "image/x-icon",
-      bmp: "image/bmp",
-      tiff: "image/tiff",
-      tif: "image/tiff",
-
-      // Documents
-      pdf: "application/pdf",
-      doc: "application/msword",
-      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      xls: "application/vnd.ms-excel",
-      xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      ppt: "application/vnd.ms-powerpoint",
-      pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-
-      // Audio
-      mp3: "audio/mpeg",
-      wav: "audio/wav",
-      ogg: "audio/ogg",
-      m4a: "audio/mp4",
-
-      // Video
-      mp4: "video/mp4",
-      avi: "video/x-msvideo",
-      mov: "video/quicktime",
-      wmv: "video/x-ms-wmv",
-      flv: "video/x-flv",
-      webm: "video/webm",
-
-      // Archives
-      zip: "application/zip",
-      rar: "application/x-rar-compressed",
-      tar: "application/x-tar",
-      gz: "application/gzip",
-      "7z": "application/x-7z-compressed",
-
-      // Other
-      bin: "application/octet-stream",
-      exe: "application/octet-stream",
-      dmg: "application/octet-stream",
-    };
-
-    return mimeTypes[ext] || "application/octet-stream";
   }
 }

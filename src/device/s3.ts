@@ -1,19 +1,45 @@
-import { Device } from "../device.js";
+import { S3Client } from "bun";
+import { Device, DeviceMetadata, FileEntry, FileStat, PresignOptions } from "../device.js";
+import { StorageError } from "../errors.js";
 import { Storage } from "../storage.js";
-import crypto from "crypto";
 
+/**
+ * Configuration for the S3 device (also used by Wasabi and MinIO).
+ */
+export interface S3Options {
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucket: string;
+  /** Prefix under which all files are stored. */
+  root?: string;
+  region?: string;
+  acl?: string;
+  /** Custom S3-compatible endpoint (e.g. MinIO, Wasabi). Path-style URLs are used automatically. */
+  endpoint?: string;
+  sessionToken?: string;
+  /** Multipart part size in bytes when assembling chunked uploads (min 5 MiB). Default: 5 MiB. */
+  partSize?: number;
+  /** Number of parts uploaded in parallel during assembly. Default: 5. */
+  queueSize?: number;
+  /** Retry attempts for failed part uploads. Default: 3. */
+  retry?: number;
+}
+
+const PART_SUFFIX = ".part-";
+
+const padPart = (n: number): string => String(n).padStart(5, "0");
+
+const stripQuotes = (etag: string): string => etag.replace(/^"|"$/g, "");
+
+const baseMimeType = (type: string): string => type.split(";")[0]?.trim() ?? "";
+
+/**
+ * S3-compatible storage device built on Bun's native `S3Client`.
+ *
+ * SigV4 signing, XML parsing and multipart uploads are handled by Bun itself,
+ * so this class only maps the unified `Device` API onto S3 semantics.
+ */
 export class S3 extends Device {
-  // HTTP Methods
-  static readonly METHOD_GET = "GET";
-  static readonly METHOD_POST = "POST";
-  static readonly METHOD_PUT = "PUT";
-  static readonly METHOD_PATCH = "PATCH";
-  static readonly METHOD_DELETE = "DELETE";
-  static readonly METHOD_HEAD = "HEAD";
-  static readonly METHOD_OPTIONS = "OPTIONS";
-  static readonly METHOD_CONNECT = "CONNECT";
-  static readonly METHOD_TRACE = "TRACE";
-
   // AWS Regions
   static readonly US_EAST_1 = "us-east-1";
   static readonly US_EAST_2 = "us-east-2";
@@ -22,21 +48,20 @@ export class S3 extends Device {
   static readonly AF_SOUTH_1 = "af-south-1";
   static readonly AP_EAST_1 = "ap-east-1";
   static readonly AP_SOUTH_1 = "ap-south-1";
-  static readonly AP_NORTHEAST_3 = "ap-northeast-3";
-  static readonly AP_NORTHEAST_2 = "ap-northeast-2";
   static readonly AP_NORTHEAST_1 = "ap-northeast-1";
+  static readonly AP_NORTHEAST_2 = "ap-northeast-2";
+  static readonly AP_NORTHEAST_3 = "ap-northeast-3";
   static readonly AP_SOUTHEAST_1 = "ap-southeast-1";
   static readonly AP_SOUTHEAST_2 = "ap-southeast-2";
   static readonly CA_CENTRAL_1 = "ca-central-1";
   static readonly EU_CENTRAL_1 = "eu-central-1";
   static readonly EU_WEST_1 = "eu-west-1";
-  static readonly EU_SOUTH_1 = "eu-south-1";
   static readonly EU_WEST_2 = "eu-west-2";
   static readonly EU_WEST_3 = "eu-west-3";
+  static readonly EU_SOUTH_1 = "eu-south-1";
   static readonly EU_NORTH_1 = "eu-north-1";
-  static readonly SA_EAST_1 = "eu-north-1";
+  static readonly SA_EAST_1 = "sa-east-1";
   static readonly CN_NORTH_1 = "cn-north-1";
-  static readonly CN_NORTH_4 = "cn-north-4";
   static readonly CN_NORTHWEST_1 = "cn-northwest-1";
   static readonly ME_SOUTH_1 = "me-south-1";
   static readonly US_GOV_EAST_1 = "us-gov-east-1";
@@ -49,57 +74,38 @@ export class S3 extends Device {
   static readonly ACL_AUTHENTICATED_READ = "authenticated-read";
 
   protected static readonly MAX_PAGE_SIZE = 1000;
-  protected static retryAttempts = 3;
-  protected static retryDelay = 500;
 
-  protected accessKey: string;
-  protected secretKey: string;
-  protected bucket: string;
-  protected region: string;
-  protected acl: string = S3.ACL_PRIVATE;
-  protected root: string = "temp";
-  protected headers: Record<string, string> = {
-    host: "",
-    date: "",
-    "content-md5": "",
-    "content-type": "",
-  };
-  protected amzHeaders: Record<string, string>;
+  protected readonly client: S3Client;
+  protected readonly root: string;
+  private readonly writerOptions: Pick<S3Options, "partSize" | "queueSize" | "retry">;
 
-  constructor(
-    root: string,
-    accessKey: string,
-    secretKey: string,
-    bucket: string,
-    region: string = S3.US_EAST_1,
-    acl: string = S3.ACL_PRIVATE,
-    endpointUrl: string = "",
-  ) {
+  constructor(options: S3Options) {
     super();
-    this.accessKey = accessKey;
-    this.secretKey = secretKey;
-    this.bucket = bucket;
-    this.region = region;
-    this.root = root;
-    this.acl = acl;
-    this.amzHeaders = {};
 
-    let host: string;
-    if (endpointUrl) {
-      host = `${bucket}.${endpointUrl}`;
-    } else {
-      switch (region) {
-        case S3.CN_NORTH_1:
-        case S3.CN_NORTH_4:
-        case S3.CN_NORTHWEST_1:
-          host = `${bucket}.s3.${region}.amazonaws.cn`;
-          break;
-        default:
-          host = `${bucket}.s3.${region}.amazonaws.com`;
-      }
+    const { accessKeyId, secretAccessKey, bucket } = options;
+    if (!accessKeyId || !secretAccessKey || !bucket) {
+      throw new StorageError(
+        "INVALID_CONFIG",
+        "S3 requires `accessKeyId`, `secretAccessKey` and `bucket`",
+      );
     }
 
-    this.headers["host"] = host;
+    this.root = options.root ?? "";
+    this.writerOptions = {
+      partSize: options.partSize,
+      queueSize: options.queueSize,
+      retry: options.retry,
+    };
+
+    this.client = new S3Client({
+      accessKeyId,
+      secretAccessKey,
+      bucket,
+      region: options.region,
+      acl: options.acl as never,
+      endpoint: options.endpoint,
+      sessionToken: options.sessionToken,
+    });
   }
 
   getName(): string {
@@ -111,583 +117,267 @@ export class S3 extends Device {
   }
 
   getDescription(): string {
-    return "S3 Bucket Storage drive for AWS or on premise solution";
+    return "S3 Bucket Storage drive for AWS or on-premise solutions, powered by Bun's native S3 client";
   }
 
   getRoot(): string {
     return this.root;
   }
 
-  getPath(filename: string, prefix?: string): string {
-    return `${this.getRoot()}/${filename}`;
+  getPath(filename: string, _prefix?: string): string {
+    return this.root ? `${this.root}/${filename}` : filename;
   }
 
-  getPartitionTotalSpace(): Promise<number> {
-    throw new Error("Method not implemented.");
+  /**
+   * Map a user path to a full object key (root prefix applied).
+   */
+  protected key(path: string): string {
+    return this.getPath(path);
   }
 
-  static setRetryAttempts(attempts: number): void {
-    S3.retryAttempts = attempts;
+  async write(path: string, data: string | Buffer, contentType = ""): Promise<boolean> {
+    try {
+      await this.client.write(this.key(path), data, contentType ? { type: contentType } : {});
+      return true;
+    } catch (error) {
+      throw new StorageError("WRITE_FAILED", `Failed to write ${path}: ${errorMessage(error)}`, path);
+    }
   }
 
-  static setRetryDelay(delay: number): void {
-    S3.retryDelay = delay;
+  async read(path: string, offset = 0, length?: number): Promise<Buffer> {
+    const file = this.client.file(this.key(path));
+    const sliced =
+      length === undefined
+        ? offset > 0
+          ? file.slice(offset)
+          : file
+        : file.slice(offset, offset + length);
+
+    try {
+      return Buffer.from(await sliced.bytes());
+    } catch (error) {
+      if (isNotFound(error)) {
+        throw new StorageError("FILE_NOT_FOUND", `File not found: ${path}`, path);
+      }
+      throw new StorageError("READ_FAILED", `Failed to read ${path}: ${errorMessage(error)}`, path);
+    }
   }
 
   async upload(
-    source: string | Buffer,
+    source: string,
     path: string,
-    chunk: number = 1,
-    chunks: number = 1,
-    metadata: Record<string, any> = {},
+    chunk = 1,
+    chunks = 1,
+    metadata: DeviceMetadata = {},
   ): Promise<number> {
-    let data: Buffer;
-    let contentType: string;
-
-    if (typeof source === "string") {
-      const fs = await import("fs");
-      data = await fs.promises.readFile(source);
-      contentType = await this.getMimeType(source);
-    } else {
-      data = source;
-      contentType = metadata.contentType || "application/octet-stream";
+    const file = Bun.file(source);
+    if (!(await file.exists())) {
+      throw new StorageError("FILE_NOT_FOUND", `Source file not found: ${source}`, source);
     }
+
+    const data = Buffer.from(await file.arrayBuffer());
+    const contentType =
+      typeof metadata.contentType === "string" && metadata.contentType.length > 0
+        ? metadata.contentType
+        : baseMimeType(file.type) || "application/octet-stream";
 
     return this.uploadData(data, path, contentType, chunk, chunks, metadata);
   }
 
   async uploadData(
-    data: Buffer,
+    data: string | Buffer,
     path: string,
     contentType: string,
-    chunk: number = 1,
-    chunks: number = 1,
-    metadata: Record<string, any> = {},
+    chunk = 1,
+    chunks = 1,
+    metadata: DeviceMetadata = {},
   ): Promise<number> {
-    if (chunk === 1 && chunks === 1) {
+    if (chunks <= 1) {
       await this.write(path, data, contentType);
       return 1;
     }
 
-    let uploadId = metadata["uploadId"];
-    if (!uploadId) {
-      uploadId = await this.createMultipartUpload(path, contentType);
-      metadata["uploadId"] = uploadId;
+    const key = this.key(path);
+
+    // Stage each chunk as its own object, then assemble with a streaming
+    // multipart upload once every chunk has arrived.
+    const partKey = `${key}${PART_SUFFIX}${padPart(chunk)}`;
+    await this.client.write(partKey, data, { type: contentType });
+
+    const received = Number(metadata.receivedChunks ?? 0) + 1;
+    metadata.receivedChunks = received;
+
+    if (received < chunks) {
+      return received;
     }
 
-    metadata["parts"] = metadata["parts"] || {};
-    metadata["chunks"] = metadata["chunks"] || 0;
-
-    const etag = await this.uploadPart(
-      data,
-      path,
-      contentType,
-      chunk,
-      uploadId,
-    );
-    const cleanETag = etag.replace(/^"|"$/g, "");
-
-    if (!(chunk in metadata["parts"])) {
-      metadata["chunks"]++;
-    }
-
-    metadata["parts"][chunk] = cleanETag;
-
-    if (metadata["chunks"] === chunks) {
-      await this.completeMultipartUpload(path, uploadId, metadata["parts"]);
-    }
-
-    return metadata["chunks"];
-  }
-
-  async transfer(
-    path: string,
-    destination: string,
-    device: Device,
-  ): Promise<boolean> {
     try {
-      const response = await this.getInfo(path);
-      const size = parseInt(response["content-length"] || "0");
-      const contentType = response["content-type"] || "";
-
-      if (size <= this.transferChunkSize) {
-        const source = await this.read(path);
-        return device.write(destination, source, contentType);
+      const writer = this.client.file(key, { type: contentType }).writer({ ...this.writerOptions });
+      for (let i = 1; i <= chunks; i++) {
+        writer.write(await this.client.file(`${key}${PART_SUFFIX}${padPart(i)}`).bytes());
       }
+      await writer.end();
+    } catch (error) {
+      throw new StorageError("UPLOAD_FAILED", `Failed to assemble chunks for ${path}: ${errorMessage(error)}`, path);
+    } finally {
+      await this.deleteStagedParts(key, chunks);
+    }
 
-      const totalChunks = Math.ceil(size / this.transferChunkSize);
-      const metadata = { content_type: contentType };
+    return received;
+  }
 
-      for (let counter = 0; counter < totalChunks; counter++) {
-        const start = counter * this.transferChunkSize;
-        const data = await this.read(path, start, this.transferChunkSize);
-        await device.uploadData(
-          data,
-          destination,
-          contentType,
-          counter + 1,
-          totalChunks,
-          metadata,
-        );
-      }
+  /**
+   * Abort a chunked upload: remove any staged part objects.
+   */
+  async abort(path: string, _extra = ""): Promise<boolean> {
+    await this.deleteStagedPartsByPrefix(`${this.key(path)}${PART_SUFFIX}`);
+    return true;
+  }
 
+  async delete(path: string, _recursive = false): Promise<boolean> {
+    try {
+      await this.client.delete(this.key(path));
       return true;
-    } catch (e) {
-      throw new Error("File not found");
+    } catch (error) {
+      throw new StorageError("DELETE_FAILED", `Failed to delete ${path}: ${errorMessage(error)}`, path);
     }
-  }
-
-  protected async createMultipartUpload(
-    path: string,
-    contentType: string,
-  ): Promise<string> {
-    const uri =
-      path !== ""
-        ? `/${encodeURIComponent(path).replace(/%2F/g, "/").replace(/%3F/g, "?")}`
-        : "/";
-
-    this.headers["content-md5"] = Buffer.from(this.md5("")).toString("base64");
-    delete this.amzHeaders["x-amz-content-sha256"];
-    this.headers["content-type"] = contentType;
-    this.amzHeaders["x-amz-acl"] = this.acl;
-
-    const response = await this.call(S3.METHOD_POST, uri, "", { uploads: "" });
-    const uploadId =
-      response.body?.InitiateMultipartUploadResult?.UploadId?.[0];
-    return uploadId;
-  }
-
-  protected async uploadPart(
-    data: Buffer,
-    path: string,
-    contentType: string,
-    chunk: number,
-    uploadId: string,
-  ): Promise<string> {
-    const uri =
-      path !== ""
-        ? `/${encodeURIComponent(path).replace(/%2F/g, "/").replace(/%3F/g, "?")}`
-        : "/";
-
-    this.headers["content-type"] = contentType;
-    this.headers["content-md5"] = Buffer.from(this.md5(data)).toString(
-      "base64",
-    );
-    this.amzHeaders["x-amz-content-sha256"] = this.sha256(data);
-    delete this.amzHeaders["x-amz-acl"];
-
-    const response = await this.call(S3.METHOD_PUT, uri, data, {
-      partNumber: chunk.toString(),
-      uploadId: uploadId,
-    });
-
-    return response.headers["etag"];
-  }
-
-  protected async completeMultipartUpload(
-    path: string,
-    uploadId: string,
-    parts: Record<number, string>,
-  ): Promise<boolean> {
-    const uri =
-      path !== ""
-        ? `/${encodeURIComponent(path).replace(/%2F/g, "/").replace(/%3F/g, "?")}`
-        : "/";
-
-    let body = "<CompleteMultipartUpload>";
-    for (const [key, etag] of Object.entries(parts)) {
-      body += `<Part><ETag>${etag}</ETag><PartNumber>${key}</PartNumber></Part>`;
-    }
-    body += "</CompleteMultipartUpload>";
-
-    this.amzHeaders["x-amz-content-sha256"] = this.sha256(body);
-    this.headers["content-md5"] = Buffer.from(this.md5(body)).toString(
-      "base64",
-    );
-    await this.call(S3.METHOD_POST, uri, body, { uploadId });
-
-    return true;
-  }
-
-  async abort(path: string, extra: string = ""): Promise<boolean> {
-    const uri =
-      path !== "" ? `/${encodeURIComponent(path).replace(/%2F/g, "/")}` : "/";
-    delete this.headers["content-type"];
-    this.headers["content-md5"] = Buffer.from(this.md5("")).toString("base64");
-    await this.call(S3.METHOD_DELETE, uri, "", { uploadId: extra });
-    return true;
-  }
-
-  async read(
-    path: string,
-    offset: number = 0,
-    length?: number,
-  ): Promise<Buffer> {
-    delete this.amzHeaders["x-amz-acl"];
-    delete this.amzHeaders["x-amz-content-sha256"];
-    delete this.headers["content-type"];
-    this.headers["content-md5"] = Buffer.from(this.md5("")).toString("base64");
-
-    const uri =
-      path !== "" ? `/${encodeURIComponent(path).replace(/%2F/g, "/")}` : "/";
-
-    if (length !== undefined) {
-      const end = offset + length - 1;
-      this.headers["range"] = `bytes=${offset}-${end}`;
-    } else {
-      delete this.headers["range"];
-    }
-
-    const response = await this.call(S3.METHOD_GET, uri, "", {}, false);
-    return Buffer.from(response.buffer);
-  }
-
-  async write(
-    path: string,
-    data: Buffer,
-    contentType: string = "",
-  ): Promise<boolean> {
-    const uri =
-      path !== ""
-        ? `/${encodeURIComponent(path).replace(/%2F/g, "/").replace(/%3F/g, "?")}`
-        : "/";
-
-    this.headers["content-type"] = contentType;
-    this.headers["content-md5"] = Buffer.from(this.md5(data)).toString(
-      "base64",
-    );
-    this.amzHeaders["x-amz-content-sha256"] = this.sha256(data);
-    this.amzHeaders["x-amz-acl"] = this.acl;
-
-    await this.call(S3.METHOD_PUT, uri, data);
-    return true;
-  }
-
-  async delete(path: string, recursive: boolean = false): Promise<boolean> {
-    const uri =
-      path !== "" ? `/${encodeURIComponent(path).replace(/%2F/g, "/")}` : "/";
-
-    delete this.headers["content-type"];
-    delete this.amzHeaders["x-amz-acl"];
-    delete this.amzHeaders["x-amz-content-sha256"];
-    this.headers["content-md5"] = Buffer.from(this.md5("")).toString("base64");
-
-    await this.call(S3.METHOD_DELETE, uri);
-    return true;
-  }
-
-  protected async listObjects(
-    prefix: string = "",
-    maxKeys: number = S3.MAX_PAGE_SIZE,
-    continuationToken: string = "",
-  ): Promise<any> {
-    if (maxKeys > S3.MAX_PAGE_SIZE) {
-      throw new Error(`Cannot list more than ${S3.MAX_PAGE_SIZE} objects`);
-    }
-
-    const uri = "/";
-    prefix = prefix.replace(/^\//, "");
-    this.headers["content-type"] = "text/plain";
-    this.headers["content-md5"] = Buffer.from(this.md5("")).toString("base64");
-
-    delete this.amzHeaders["x-amz-content-sha256"];
-    delete this.amzHeaders["x-amz-acl"];
-
-    const parameters: Record<string, string> = {
-      "list-type": "2",
-      prefix: prefix,
-      "max-keys": maxKeys.toString(),
-    };
-
-    if (continuationToken) {
-      parameters["continuation-token"] = continuationToken;
-    }
-
-    const response = await this.call(S3.METHOD_GET, uri, "", parameters);
-    return response.body;
   }
 
   async deletePath(path: string): Promise<boolean> {
-    path = `${this.getRoot()}/${path}`;
-
-    const uri = "/";
-    let continuationToken = "";
+    const prefix = `${this.key(path)}/`;
+    let continuationToken: string | undefined;
 
     do {
-      const objects = await this.listObjects(
-        path,
-        S3.MAX_PAGE_SIZE,
+      const page = await this.client.list({
+        prefix,
+        maxKeys: S3.MAX_PAGE_SIZE,
         continuationToken,
-      );
-      const count = parseInt(objects["KeyCount"] || "1");
+      });
 
-      if (count < 1) break;
+      const keys = (page.contents ?? []).map((object) => object.key);
+      await Promise.all(keys.map((k) => this.client.delete(k)));
 
-      continuationToken = objects["NextContinuationToken"] || "";
-      let body = '<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
-
-      if (count > 1) {
-        for (const object of objects["Contents"]) {
-          body += `<Object><Key>${object["Key"]}</Key></Object>`;
-        }
-      } else {
-        body += `<Object><Key>${objects["Contents"]["Key"]}</Key></Object>`;
-      }
-
-      body += "<Quiet>true</Quiet></Delete>";
-
-      this.amzHeaders["x-amz-content-sha256"] = this.sha256(body);
-      this.headers["content-md5"] = Buffer.from(this.md5(body)).toString(
-        "base64",
-      );
-      await this.call(S3.METHOD_POST, uri, body, { delete: "" });
+      continuationToken = page.isTruncated ? page.nextContinuationToken : undefined;
     } while (continuationToken);
 
     return true;
   }
 
   async exists(path: string): Promise<boolean> {
+    return this.client.exists(this.key(path));
+  }
+
+  async stat(path: string): Promise<FileStat> {
     try {
-      await this.getInfo(path);
-      return true;
-    } catch {
-      return false;
+      const s = await this.client.stat(this.key(path));
+      return {
+        size: s.size,
+        mimeType: baseMimeType(s.type),
+        etag: s.etag ? stripQuotes(s.etag) : undefined,
+        lastModified: s.lastModified,
+      };
+    } catch (error) {
+      if (isNotFound(error)) {
+        throw new StorageError("FILE_NOT_FOUND", `File not found: ${path}`, path);
+      }
+      throw error;
     }
   }
 
   async getFileSize(path: string): Promise<number> {
-    const response = await this.getInfo(path);
-    return parseInt(response["content-length"] || "0");
+    return (await this.stat(path)).size;
   }
 
   async getFileMimeType(path: string): Promise<string> {
-    const response = await this.getInfo(path);
-    return response["content-type"] || "";
+    return (await this.stat(path)).mimeType;
   }
 
   async getFileHash(path: string): Promise<string> {
-    const etag = (await this.getInfo(path))["etag"] || "";
-    return etag ? etag.slice(1, -1) : etag;
+    // For non-multipart objects the ETag is the object's MD5 hash.
+    return (await this.stat(path)).etag ?? "";
   }
 
-  async createDirectory(path: string): Promise<boolean> {
-    return true; // S3 doesn't have directories
+  presign(path: string, options: PresignOptions = {}): string {
+    return this.client.presign(this.key(path), options as never);
+  }
+
+  async createDirectory(_path: string): Promise<boolean> {
+    return true; // Object storage has no real directories.
   }
 
   async getDirectorySize(path: string): Promise<number> {
+    let size = 0;
+    let continuationToken: string | undefined;
+
+    do {
+      const page = await this.client.list({
+        prefix: `${this.key(path)}/`,
+        maxKeys: S3.MAX_PAGE_SIZE,
+        continuationToken,
+      });
+
+      for (const object of page.contents ?? []) {
+        size += object.size ?? 0;
+      }
+
+      continuationToken = page.isTruncated ? page.nextContinuationToken : undefined;
+    } while (continuationToken);
+
+    return size;
+  }
+
+  async getPartitionFreeSpace(): Promise<number> {
     return -1;
   }
 
-  async getPartitionFreeSpace() {
+  async getPartitionTotalSpace(): Promise<number> {
     return -1;
   }
 
-  async getFiles(
-    dir: string,
-    max: number = S3.MAX_PAGE_SIZE,
-    continuationToken: string = "",
-  ): Promise<any> {
-    const data = await this.listObjects(dir, max, continuationToken);
-    data["IsTruncated"] = data["IsTruncated"] === "true";
-    data["KeyCount"] = parseInt(data["KeyCount"]);
-    data["MaxKeys"] = parseInt(data["MaxKeys"]);
-    return data;
-  }
-
-  private async getInfo(path: string): Promise<Record<string, string>> {
-    delete this.headers["content-type"];
-    delete this.amzHeaders["x-amz-acl"];
-    delete this.amzHeaders["x-amz-content-sha256"];
-    this.headers["content-md5"] = Buffer.from(this.md5("")).toString("base64");
-
-    const uri =
-      path !== "" ? `/${encodeURIComponent(path).replace(/%2F/g, "/")}` : "/";
-    const response = await this.call(S3.METHOD_HEAD, uri);
-    return response.headers;
-  }
-
-  protected getSignatureV4(
-    method: string,
-    uri: string,
-    parameters: Record<string, string> = {},
-  ): string {
-    const service = "s3";
-    const region = this.region;
-    const algorithm = "AWS4-HMAC-SHA256";
-    const combinedHeaders: Record<string, string> = {};
-
-    const amzDateStamp = this.amzHeaders["x-amz-date"].substring(0, 8);
-
-    // Combine headers
-    for (const [k, v] of Object.entries(this.headers)) {
-      combinedHeaders[k.toLowerCase()] = v.trim();
-    }
-
-    for (const [k, v] of Object.entries(this.amzHeaders)) {
-      combinedHeaders[k.toLowerCase()] = v.trim();
-    }
-
-    // Sort headers
-    const sortedHeaders = Object.keys(combinedHeaders).sort();
-    const sortedCombinedHeaders: Record<string, string> = {};
-    for (const key of sortedHeaders) {
-      sortedCombinedHeaders[key] = combinedHeaders[key];
-    }
-
-    // Sort parameters
-    const sortedParams = Object.keys(parameters).sort();
-    const queryString = sortedParams
-      .map(
-        (key) =>
-          `${encodeURIComponent(key)}=${encodeURIComponent(parameters[key])}`,
-      )
-      .join("&");
-
-    // Create canonical request
-    const canonicalRequest = [
-      method,
-      uri.split("?")[0],
-      queryString,
-      ...Object.entries(sortedCombinedHeaders).map(([k, v]) => `${k}:${v}`),
-      "",
-      Object.keys(sortedCombinedHeaders).join(";"),
-      this.amzHeaders["x-amz-content-sha256"],
-    ].join("\n");
-
-    // Create string to sign
-    const credentialScope = [
-      amzDateStamp,
-      region,
-      service,
-      "aws4_request",
-    ].join("/");
-    const stringToSign = [
-      algorithm,
-      this.amzHeaders["x-amz-date"],
-      credentialScope,
-      this.sha256(canonicalRequest),
-    ].join("\n");
-
-    // Calculate signature
-    const kSecret = `AWS4${this.secretKey}`;
-    const kDate = this.hmacSha256(amzDateStamp, kSecret);
-    const kRegion = this.hmacSha256(region, kDate);
-    const kService = this.hmacSha256(service, kRegion);
-    const kSigning = this.hmacSha256("aws4_request", kService);
-    const signature = this.hmacSha256(stringToSign, kSigning, "hex");
-
-    return `${algorithm} Credential=${this.accessKey}/${credentialScope},SignedHeaders=${Object.keys(sortedCombinedHeaders).join(";")},Signature=${signature}`;
-  }
-
-  protected async call(
-    method: string,
-    uri: string,
-    data: string | Buffer = "",
-    parameters: Record<string, string> = {},
-    decode: boolean = true,
-  ): Promise<{
-    body: any;
-    buffer: ArrayBuffer;
-    headers: Record<string, string>;
-    code: number;
-  }> {
-    uri = this.getAbsolutePath(uri);
-    const queryString = Object.keys(parameters).length
-      ? "?" +
-        Object.entries(parameters)
-          .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-          .join("&")
-      : "";
-    const url = `https://${this.headers["host"]}${uri}${queryString}`;
-
-    this.amzHeaders["x-amz-date"] = new Date()
-      .toISOString()
-      .replace(/[:-]|\.\d{3}/g, "");
-
-    if (!this.amzHeaders["x-amz-content-sha256"]) {
-      this.amzHeaders["x-amz-content-sha256"] = this.sha256(data);
-    }
-
-    const headers: Record<string, string> = {};
-
-    for (const [header, value] of Object.entries(this.amzHeaders)) {
-      if (value.length > 0) {
-        headers[header] = value;
-      }
-    }
-
-    this.headers["date"] = new Date().toUTCString();
-
-    for (const [header, value] of Object.entries(this.headers)) {
-      if (value.length > 0) {
-        headers[header] = value;
-      }
-    }
-
-    headers["Authorization"] = this.getSignatureV4(method, uri, parameters);
-
-    const fetchOptions: RequestInit = {
-      method,
-      headers,
-    };
-
-    if (method === S3.METHOD_PUT || method === S3.METHOD_POST) {
-      fetchOptions.body = data;
-    }
-
-    const response = await fetch(url, fetchOptions);
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`HTTP ${response.status}: ${errorBody}`);
-    }
-
-    const responseHeaders: Record<string, string> = {};
-    response.headers.forEach((value, key) => {
-      responseHeaders[key.toLowerCase()] = value;
+  async getFiles(dir: string, max = S3.MAX_PAGE_SIZE, continuationToken = ""): Promise<FileEntry[]> {
+    const page = await this.client.list({
+      prefix: dir ? `${this.key(dir)}/` : `${this.root}/`,
+      maxKeys: Math.min(max, S3.MAX_PAGE_SIZE),
+      continuationToken: continuationToken || undefined,
     });
 
-    const buffer = await response.arrayBuffer();
-    let body = new TextDecoder().decode(buffer);
-
-    if (
-      decode &&
-      (responseHeaders["content-type"] === "application/xml" ||
-        (body.startsWith("<?xml") &&
-          responseHeaders["content-type"] !== "image/svg+xml"))
-    ) {
-      const xml2js = await import("xml2js");
-      const parser = new xml2js.Parser();
-      body = await parser.parseStringPromise(body);
-    }
-
-    return {
-      body,
-      buffer,
-      headers: responseHeaders,
-      code: response.status,
-    };
+    return (page.contents ?? []).map((object) => ({
+      key: object.key,
+      size: object.size,
+      lastModified: object.lastModified ? new Date(object.lastModified) : undefined,
+      etag: object.eTag ? stripQuotes(object.eTag) : undefined,
+    }));
   }
 
-  protected md5(data: string | Buffer): Buffer {
-    const buffer = typeof data === "string" ? Buffer.from(data, "utf8") : data;
-    return crypto.createHash("md5").update(buffer).digest();
+  /**
+   * Remove staged part objects after assembly or failure.
+   */
+  private async deleteStagedParts(key: string, chunks: number): Promise<void> {
+    await Promise.all(
+      Array.from({ length: chunks }, (_, i) =>
+        this.client.delete(`${key}${PART_SUFFIX}${padPart(i + 1)}`).catch(() => undefined),
+      ),
+    );
   }
 
-  protected sha256(data: string | Buffer): string {
-    const buffer = typeof data === "string" ? Buffer.from(data, "utf8") : data;
-    return crypto.createHash("sha256").update(buffer).digest("hex");
+  /**
+   * List and delete all staged parts matching a prefix (used by `abort`).
+   */
+  private async deleteStagedPartsByPrefix(prefix: string): Promise<void> {
+    const page = await this.client.list({ prefix, maxKeys: S3.MAX_PAGE_SIZE });
+    await Promise.all(
+      (page.contents ?? []).map((object) =>
+        this.client.delete(object.key).catch(() => undefined),
+      ),
+    );
   }
+}
 
-  protected hmacSha256(
-    data: string | Buffer,
-    key: string | Buffer,
-    encoding: "hex" | "binary" = "binary",
-  ): string | Buffer {
-    const dataBuffer =
-      typeof data === "string" ? Buffer.from(data, "utf8") : data;
-    const hmac = crypto.createHmac("sha256", key);
-    hmac.update(dataBuffer);
-    return encoding === "hex" ? hmac.digest("hex") : hmac.digest();
-  }
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isNotFound(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return message.includes("404") || message.includes("nosuchkey");
 }

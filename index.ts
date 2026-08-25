@@ -1,3 +1,4 @@
+export * from "./src/errors.js";
 export * from "./src/device.js";
 export * from "./src/storage.js";
 export * from "./src/validator/file.js";

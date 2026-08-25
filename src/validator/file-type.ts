@@ -1,4 +1,3 @@
-import { readFile } from "fs/promises";
 import { Validator } from "./validator.js";
 
 export class FileType extends Validator {
@@ -11,13 +10,13 @@ export class FileType extends Validator {
   static readonly FILE_TYPE_GZIP = "gz";
 
   /**
-   * File Type Binaries.
+   * Magic-byte signatures used to identify file content.
    */
-  private readonly types: Record<string, string> = {
-    [FileType.FILE_TYPE_JPEG]: "\xFF\xD8\xFF",
-    [FileType.FILE_TYPE_GIF]: "GIF",
-    [FileType.FILE_TYPE_PNG]: "\x89\x50\x4e\x47\x0d\x0a",
-    [FileType.FILE_TYPE_GZIP]: "application/x-gzip",
+  private readonly types: Record<string, number[]> = {
+    [FileType.FILE_TYPE_JPEG]: [0xff, 0xd8, 0xff],
+    [FileType.FILE_TYPE_GIF]: [0x47, 0x49, 0x46], // "GIF"
+    [FileType.FILE_TYPE_PNG]: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a],
+    [FileType.FILE_TYPE_GZIP]: [0x1f, 0x8b],
   };
 
   private readonly allowed: string[];
@@ -34,39 +33,28 @@ export class FileType extends Validator {
     this.allowed = allowed;
   }
 
-  /**
-   * Get Description
-   */
   getDescription(): string {
     return "File mime-type is not allowed ";
   }
 
   /**
-   * Is Valid.
-   *
-   * Binary check to finds whether a file is of valid type
+   * Binary signature check: reads only the first few bytes of the file
+   * (via Bun.file slice) instead of loading the whole file into memory.
    */
   async isValid(path: string): Promise<boolean> {
     try {
-      const buffer = await readFile(path);
-
-      // Calculate the maximum signature length needed
       const maxSignatureLength = Math.max(
         ...Object.values(this.types).map((sig) => sig.length),
       );
-      const bytesToRead = Math.min(
-        buffer.length,
-        Math.max(8, maxSignatureLength),
-      );
-      const bytes = buffer.toString("binary", 0, bytesToRead);
+      const head = await Bun.file(path).slice(0, maxSignatureLength).bytes();
 
-      for (const key of this.allowed) {
-        if (bytes.indexOf(this.types[key]) === 0) {
-          return true;
-        }
-      }
-
-      return false;
+      return this.allowed.some((key) => {
+        const signature = this.types[key];
+        return (
+          signature !== undefined &&
+          signature.every((byte, index) => head[index] === byte)
+        );
+      });
     } catch {
       return false;
     }

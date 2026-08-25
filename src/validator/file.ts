@@ -13,7 +13,7 @@ export class File extends Validator {
    * @param name
    * @return boolean
    */
-  public isValid(name: any): boolean {
+  public isValid(_name: any): boolean {
     return true;
   }
 }

@@ -1,23 +1,22 @@
 {
   "compilerOptions": {
-    "target": "es2024",
-    "module": "nodenext",
-    "lib": ["ES2024"],
-    "declaration": true,
-    "declarationMap": true,
-    "outDir": "./dist",
-    "rootDir": "./",
+    "target": "esnext",
+    "module": "esnext",
+    "lib": ["ESNext"],
+    "types": ["bun"],
+    "moduleResolution": "bundler",
     "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "moduleResolution":"nodenext",
-    "allowImportingTsExtensions": false,
-    "noEmitOnError": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    "verbatimModuleSyntax": false,
+    "noEmit": true
   },
-  "include": ["src", "index.ts"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts", "__tests__"]
+  "include": ["src", "index.ts", "__tests__"],
+  "exclude": ["node_modules", "dist"]
 }

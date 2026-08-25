@@ -22,35 +22,37 @@ This directory contains comprehensive tests for the Nuvix Storage library.
 
 ## Running Tests
 
+Tests run on Bun's native test runner (`bun:test`).
+
 ### All Tests
 
 ```bash
-npm test
+bun test
 ```
 
 ### With Coverage
 
 ```bash
-npm run test:coverage
+bun run test:coverage
 ```
 
 ### Watch Mode
 
 ```bash
-npm run test:watch
+bun run test:watch
 ```
 
 ### Specific Test Files
 
 ```bash
 # Run only storage tests
-npx jest storage.test.ts
+bun test storage.test.ts
 
 # Run only device tests
-npx jest device/
+bun test device/
 
 # Run only validator tests
-npx jest validator/
+bun test validator/
 ```
 
 ## Test Configuration

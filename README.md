@@ -1,361 +1,227 @@
 # @nuvix/storage
 
-A powerful, TypeScript-first S3-compatible storage library for the Nuvix BaaS platform. Supports multiple storage backends including local filesystem, AWS S3, Wasabi, and MinIO with a unified API.
+A TypeScript-first storage library for the Nuvix BaaS platform, built entirely on [Bun](https://bun.sh)'s native APIs (`Bun.file`, `Bun.S3Client`). Provides a unified API across local filesystem, AWS S3, Wasabi, and MinIO — with zero runtime dependencies.
 
-## ✨ Features
+## Requirements
 
-- 🚀 **S3-Compatible API** - Consistent interface across all storage providers
-- 🔌 **Multiple Storage Backends** - Local, AWS S3, Wasabi, MinIO, and more
-- 📝 **TypeScript First** - Full type safety with comprehensive TypeScript definitions
-- ✅ **File Validation** - Built-in validators for file types, sizes, names, and extensions
-- 🔄 **Chunked Uploads** - Support for large file uploads with multipart upload
-- 🌐 **Modern Builds** - ESM and CommonJS support for maximum compatibility
-- 🧪 **Well Tested** - Comprehensive test suite with real implementation testing
+- **[Bun](https://bun.sh) >= 1.2.0** (required at runtime — this library is Bun-only)
 
-## 📦 Installation
+## Features
+
+- 🚀 **Zero dependencies** — signing, multipart uploads, and XML parsing are handled natively by `Bun.S3Client`
+- 🔌 **Multiple backends** — Local filesystem, AWS S3, Wasabi, and MinIO behind one interface
+- ✍️ **Options-object constructors** — explicit, typed configuration for every device
+- 🔏 **Presigned URLs** — generate time-limited upload/download URLs offline (no network call)
+- 📊 **File stats** — size + MIME type in a single `stat()` call
+- 🔄 **Chunked uploads** — large files assembled from ordered chunks, with abort support
+- 🛡️ **Typed errors** — every failure throws a `StorageError` with a machine-readable `code`
+- ✅ **Validators** — file extension, name, size, content type (magic bytes), and upload checks
+
+## Installation
 
 ```bash
-# Using npm
-npm install @nuvix/storage
-
-# Using yarn
-yarn add @nuvix/storage
-
-# Using pnpm
-pnpm add @nuvix/storage
-
-# Using bun
 bun add @nuvix/storage
 ```
 
-## 🚀 Quick Start
-
-### ESM (Modern)
+## Quick Start
 
 ```typescript
-import {
-  Storage,
-  Local,
-  Wasabi,
-  MinIO,
-  FileExt,
-  FileSize,
-} from "@nuvix/storage";
+import { Storage, Local } from "@nuvix/storage";
 
-// Set up local storage
-const localStorage = new Local("./uploads");
+const localStorage = new Local({ root: "./uploads" });
 Storage.setDevice(Storage.DEVICE_LOCAL, localStorage);
 
-// Upload a file
-const localDevice = Storage.getDevice(Storage.DEVICE_LOCAL);
-await localDevice.write("test.txt", "Hello, World!", "text/plain");
+const device = Storage.getDevice(Storage.DEVICE_LOCAL);
+await device.write("hello.txt", "Hello, World!", "text/plain");
+
+console.log(await device.read("hello.txt")); // Buffer("Hello, World!")
 ```
 
-### CommonJS (Legacy)
+## Storage Devices
 
-```javascript
-const { Storage, Local, Wasabi, MinIO } = require("@nuvix/storage");
-
-// Set up local storage
-const localStorage = new Local("./uploads");
-Storage.setDevice(Storage.DEVICE_LOCAL, localStorage);
-```
-
-## 🔧 Storage Devices
-
-### Local File System
+### Local Filesystem
 
 ```typescript
-import { Local, Storage } from "@nuvix/storage";
+import { Local } from "@nuvix/storage";
 
-const localStorage = new Local("./uploads");
-Storage.setDevice("local", localStorage);
+// Root defaults to the current working directory
+const device = new Local({ root: "./uploads" });
 
-// Write file
-await localStorage.write("documents/file.txt", "content", "text/plain");
-
-// Read file
-const content = await localStorage.read("documents/file.txt");
-
-// Check if file exists
-const exists = await localStorage.exists("documents/file.txt");
-```
-
-### Wasabi Cloud Storage
-
-```typescript
-import { Wasabi, Storage } from "@nuvix/storage";
-
-const wasabiStorage = new Wasabi(
-  "my-app-uploads", // root path
-  "your-access-key", // access key
-  "your-secret-key", // secret key
-  "your-bucket-name", // bucket name
-  Wasabi.US_CENTRAL_1, // region
-  Wasabi.ACL_PRIVATE, // ACL (optional)
-);
-
-Storage.setDevice("wasabi", wasabiStorage);
-
-// Upload with metadata
-await wasabiStorage.uploadData(
-  "Hello, Cloud!",
-  "cloud-file.txt",
-  "text/plain",
-  1,
-  1,
-  { author: "user123" },
-);
+await device.write("docs/report.pdf", buffer);
+await device.exists("docs/report.pdf"); // true
+await device.stat("docs/report.pdf");   // { size, mimeType }
 ```
 
 ### AWS S3
 
 ```typescript
-import { S3, Storage } from "@nuvix/storage";
+import { S3 } from "@nuvix/storage";
 
-const s3Storage = new S3(
-  "my-app-uploads", // root path
-  "your-access-key", // access key
-  "your-secret-key", // secret key
-  "your-bucket-name", // bucket name
-  S3.US_EAST_1, // region
-  S3.ACL_PRIVATE, // ACL (optional)
-);
+const device = new S3({
+  accessKeyId: "your-access-key",
+  secretAccessKey: "your-secret-key",
+  bucket: "your-bucket",
+  region: S3.US_EAST_1,       // default
+  acl: S3.ACL_PRIVATE,        // optional
+  root: "app-uploads",        // optional key prefix
+  endpoint: "https://...",    // optional custom endpoint (path-style URLs)
+});
 
-Storage.setDevice("s3", s3Storage);
+// Presigned URL — computed locally, no network round-trip
+const url = device.presign("reports/q3.pdf", { expiresIn: 3600 });
+```
+
+### Wasabi
+
+```typescript
+import { Wasabi } from "@nuvix/storage";
+
+// Endpoint is derived automatically: https://s3.{region}.wasabisys.com
+const device = new Wasabi({
+  accessKeyId: "your-access-key",
+  secretAccessKey: "your-secret-key",
+  bucket: "your-bucket",
+  region: Wasabi.EU_CENTRAL_1, // default
+});
 ```
 
 ### MinIO
 
 ```typescript
-import { MinIO, Storage } from "@nuvix/storage";
+import { MinIO } from "@nuvix/storage";
 
-const minioStorage = new MinIO(
-  "my-app-uploads", // root path
-  "minioadmin", // access key (default MinIO credentials)
-  "minioadmin", // secret key (default MinIO credentials)
-  "your-bucket-name", // bucket name
-  "localhost:9000", // MinIO endpoint
-  MinIO.ACL_PRIVATE, // ACL (optional)
-  false, // useSSL (optional, default: false)
-);
-
-Storage.setDevice("minio", minioStorage);
-
-// Upload to MinIO
-await minioStorage.write("local-file.txt", "Hello, MinIO!", "text/plain");
-
-// Read from MinIO
-const content = await minioStorage.read("local-file.txt");
-
-// Check if file exists
-const exists = await minioStorage.exists("local-file.txt");
-
-// Get file information
-const size = await minioStorage.getFileSize("local-file.txt");
-const mimeType = await minioStorage.getFileMimeType("local-file.txt");
+const device = new MinIO({
+  accessKeyId: "minioadmin",
+  secretAccessKey: "minioadmin",
+  bucket: "your-bucket",
+  endpoint: "localhost:9000", // default; protocol prefix is stripped
+  useSSL: false,              // default
+});
 ```
 
-## 🛡️ File Validation
-
-### File Extension Validation
+## File Validation
 
 ```typescript
-import { FileExt } from "@nuvix/storage";
+import { FileExt, FileName, FileSize, FileType, Upload } from "@nuvix/storage";
 
-const imageValidator = new FileExt(["jpg", "png", "gif", "webp"]);
+new FileExt(["jpg", "png"]).isValid("photo.jpg");     // true
+new FileName().isValid("report_2024.pdf");            // true
+new FileSize(5 * 1024 * 1024).isValid(1024);          // true (< 5MB)
 
-console.log(imageValidator.isValid("photo.jpg")); // true
-console.log(imageValidator.isValid("document.pdf")); // false
+// Content-type check via magic bytes — reads only the first few bytes of the file
+await new FileType([FileType.FILE_TYPE_PNG]).isValid("./maybe-image.png");
+
+// Verifies the file actually exists on disk
+await new Upload().isValid("./uploaded.txt");
 ```
 
-### File Size Validation
+## Error Handling
+
+All failures throw a `StorageError` with a stable `code` you can branch on:
 
 ```typescript
-import { FileSize } from "@nuvix/storage";
+import { StorageError } from "@nuvix/storage";
 
-const sizeValidator = new FileSize(5 * 1024 * 1024); // 5MB limit
-
-console.log(sizeValidator.isValid(1024 * 1024)); // true (1MB)
-console.log(sizeValidator.isValid(10 * 1024 * 1024)); // false (10MB)
-```
-
-### File Name Validation
-
-```typescript
-import { FileName } from "@nuvix/storage";
-
-const nameValidator = new FileName();
-
-console.log(nameValidator.isValid("validfile123.txt")); // true
-console.log(nameValidator.isValid("invalid-file.txt")); // false (contains hyphen)
-```
-
-### File Type (MIME) Validation
-
-```typescript
-import { FileType } from "@nuvix/storage";
-
-const typeValidator = new FileType(["jpeg", "png", "gif"]);
-
-// Validates based on file content, not extension
-console.log(await typeValidator.isValid("./image.jpg")); // true if actual JPEG
-```
-
-### Upload File Validation
-
-```typescript
-import { Upload } from "@nuvix/storage";
-
-const uploadValidator = new Upload();
-
-console.log(await uploadValidator.isValid("./existing-file.txt")); // true
-console.log(await uploadValidator.isValid("./non-existent.txt")); // false
-```
-
-## 🔄 Advanced Features
-
-### Chunked Uploads
-
-```typescript
-// Upload large files in chunks
-const chunks = ["chunk1", "chunk2", "chunk3"];
-const metadata = {};
-
-for (let i = 0; i < chunks.length; i++) {
-  await device.uploadData(
-    chunks[i],
-    "large-file.txt",
-    "text/plain",
-    i + 1, // current chunk
-    chunks.length, // total chunks
-    metadata,
-  );
+try {
+  await device.read("missing.txt");
+} catch (error) {
+  if (error instanceof StorageError && error.code === "FILE_NOT_FOUND") {
+    // handle gracefully
+  }
 }
 ```
 
-### File Transfer Between Devices
+| Code | Thrown when |
+|------|-------------|
+| `DEVICE_NOT_FOUND` | `Storage.getDevice()` with an unregistered name |
+| `FILE_NOT_FOUND` | Reading/stat a missing file, or aborting an upload with no staged parts |
+| `WRITE_FAILED` / `READ_FAILED` | Filesystem or S3 I/O failure |
+| `UPLOAD_FAILED` | A chunk could not be staged |
+| `TRANSFER_FAILED` | Cross-device transfer failed mid-stream |
+| `DELETE_FAILED` | Deletion failed |
+| `UNSUPPORTED_OPERATION` | e.g. `presign()` on a device without support |
+| `INVALID_CONFIG` | Device constructed with missing credentials |
+
+## Chunked Uploads
+
+Upload large files in ordered chunks; the final chunk triggers assembly:
 
 ```typescript
-const sourceDevice = Storage.getDevice("local");
-const targetDevice = Storage.getDevice("wasabi");
+const metadata = {};
+for (let chunk = 1; chunk <= totalChunks; chunk++) {
+  await device.uploadData(chunkBuffer, "big-file.bin", "application/octet-stream", chunk, totalChunks, metadata);
+}
 
-// Transfer file from local to cloud
-await sourceDevice.transfer("local-file.txt", "cloud-file.txt", targetDevice);
+// Or give up and clean any staged parts:
+await device.abort("big-file.bin");
 ```
 
-### Human-Readable File Sizes
+## Device Registry & Utilities
 
 ```typescript
-import { Storage } from "@nuvix/storage";
+Storage.setDevice("avatars", device);   // register
+Storage.getDevice("avatars");           // retrieve (throws DEVICE_NOT_FOUND)
+Storage.exists("avatars");              // boolean
+Storage.listDevices();                  // string[]
+Storage.removeDevice("avatars");        // unregister
 
-console.log(Storage.human(1024)); // "1.00kB"
-console.log(Storage.human(1048576)); // "1.00MB"
-console.log(Storage.human(1024, 2, "binary")); // "1.00KiB"
+Storage.human(1536);                    // "1.54kB"
+Storage.human(1048576, 2, "binary");    // "1.00MiB"
 ```
 
-## 🏗️ Building
+### Common Device Methods
 
-The library is built using Rollup and provides both ESM and CommonJS outputs:
+Every device implements the same interface:
+
+- `write(path, data, contentType?)` / `read(path, offset?, length?)`
+- `upload(source, path, chunk?, chunks?, metadata?)` — move a file from disk into storage
+- `uploadData(data, path, contentType, chunk?, chunks?, metadata?)` — upload raw data
+- `exists(path)` / `delete(path)` / `deletePath(path)`
+- `stat(path)` → `{ size, mimeType }`
+- `getFileSize(path)` / `getFileMimeType(path)` / `getFileHash(path)` (MD5)
+- `transfer(source, destination, targetDevice)` / `move(source, target)`
+- `createDirectory(path)` / `getDirectorySize(path)` / `getFiles(dir)`
+- `presign(path, options?)` — presigned URL where supported
+- `getTransferChunkSize()` / `setTransferChunkSize(bytes)`
+
+## Migrating from v1
+
+v2.0.0 is a breaking release:
+
+- **Bun only** — Node.js is no longer supported. The hand-rolled SigV4/XML client was replaced by `Bun.S3Client`.
+- **Constructors take a single options object** instead of positional arguments:
+  ```diff
+  - new S3("root", accessKey, secretKey, bucket, S3.US_EAST_1)
+  + new S3({ accessKeyId, secretAccessKey, bucket, region: S3.US_EAST_1, root: "root" })
+  ```
+- **ESM only** — CommonJS builds are no longer published.
+- **Errors are typed** — methods throw `StorageError` (with `.code`) instead of plain `Error`s or silent booleans.
+- **Fixed:** `S3.SA_EAST_1` now maps to `"sa-east-1"` (previously incorrectly mapped to `"eu-north-1"`).
+- **New:** `stat()`, `presign()`, `Storage.removeDevice()`, `Storage.listDevices()`, `move()`, `abort()`.
+
+## Development
 
 ```bash
-# Build for production
-bun run build
-
-# Build and watch for changes
-bun run build:watch
-
-# Clean build directory
-bun run clean
+bun install          # install dev dependencies
+bun test             # run test suite
+bun run test:watch   # watch mode
+bun run lint         # oxlint
+bun run typecheck    # tsc --noEmit
+bun run build        # bundle to dist/ (ESM + declarations)
 ```
 
-## 🧪 Testing
+Tests that hit real cloud services stay skipped unless credentials are provided via environment variables (`AWS_*`, `WASABI_*`, `MINIO_*`).
 
-Comprehensive test suite with real implementation testing:
+## Contributing
 
-```bash
-# Run all tests
-bun test
+Contributions are welcome! Please ensure `bun test`, `bun run lint`, and `bun run typecheck` all pass before opening a PR.
 
-# Run tests in watch mode
-bun run test:watch
-
-# Run tests with coverage
-bun run test:coverage
-
-# Run specific test files
-bun test storage.test.ts
-bun test device/
-bun test validator/
-```
-
-### Testing with Real Cloud Storage
-
-Set environment variables to test against real storage services:
-
-```bash
-# For Wasabi testing
-export WASABI_ACCESS_KEY="your-access-key"
-export WASABI_SECRET_KEY="your-secret-key"
-export WASABI_BUCKET="your-test-bucket"
-
-# For AWS S3 testing
-export AWS_ACCESS_KEY="your-access-key"
-export AWS_SECRET_KEY="your-secret-key"
-export AWS_BUCKET="your-test-bucket"
-
-# For MinIO testing
-export MINIO_ACCESS_KEY="minioadmin"
-export MINIO_SECRET_KEY="minioadmin"
-export MINIO_BUCKET="test-bucket"
-export MINIO_ENDPOINT="localhost:9000"
-```
-
-## 📝 API Reference
-
-### Storage Class
-
-- `Storage.setDevice(name, device)` - Register a storage device
-- `Storage.getDevice(name)` - Get a registered storage device
-- `Storage.exists(name)` - Check if a device is registered
-- `Storage.human(bytes, decimals?, system?)` - Format bytes to human-readable string
-
-### Device Interface
-
-All storage devices implement the same interface:
-
-- `upload(source, path, chunk?, chunks?, metadata?)` - Upload file
-- `uploadData(data, path, contentType, chunk?, chunks?, metadata?)` - Upload data
-- `read(path, offset?, length?)` - Read file content
-- `write(path, data, contentType)` - Write file
-- `delete(path, recursive?)` - Delete file/directory
-- `exists(path)` - Check if file exists
-- `getFileSize(path)` - Get file size
-- `getFileMimeType(path)` - Get file MIME type
-- `getFileHash(path)` - Get file MD5 hash
-- `transfer(source, destination, targetDevice)` - Transfer file
-
-## 🌍 Browser Support
-
-This library is designed for Node.js environments. For browser usage, you'll need to provide polyfills for Node.js modules or use a bundler that can handle Node.js dependencies.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please read our contributing guidelines and ensure all tests pass:
-
-```bash
-bun run lint        # Check code style
-bun run lint:fix    # Fix code style issues
-bun test           # Run test suite
-```
-
-## 📄 License
+## License
 
 MIT © [Nuvix](https://github.com/nuvix-tech/storage)
 
-## 🔗 Links
+## Links
 
 - [GitHub Repository](https://github.com/nuvix-tech/storage)
 - [NPM Package](https://www.npmjs.com/package/@nuvix/storage)
-- [Documentation](https://github.com/nuvix-tech/storage#readme)
 - [Issue Tracker](https://github.com/nuvix-tech/storage/issues)
