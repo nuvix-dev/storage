@@ -204,15 +204,33 @@ See [MIGRATION.md](./MIGRATION.md) for the full step-by-step migration guide.
 ## Development
 
 ```bash
-bun install          # install dev dependencies
-bun test             # run test suite
-bun run test:watch   # watch mode
-bun run lint         # oxlint
-bun run typecheck    # tsc --noEmit
-bun run build        # bundle to dist/ (ESM + declarations)
+bun install              # install dev dependencies
+bun test                 # run offline test suite
+bun run test:watch       # watch mode
+bun run lint             # oxlint
+bun run typecheck        # tsc --noEmit
+bun run build            # bundle to dist/ (ESM + declarations)
 ```
 
-The test suite is fully offline — cloud devices are exercised through offline-presign URL checks and config validation, so no credentials are ever needed.
+The default suite is fully offline — cloud devices are exercised through offline-presign URL checks and config validation, so no credentials are ever needed.
+
+### Integration Tests
+
+An opt-in integration suite (`__tests__/integration/`) runs against a real MinIO server and is skipped unless `MINIO_TEST_URL` is set:
+
+```bash
+# 1. Start MinIO and create the test bucket
+docker run -d --name storage-test-minio -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin-test \
+  minio/minio server /data --console-address ":9001"
+docker exec storage-test-minio mc alias set local http://localhost:9000 minioadmin minioadmin-test
+docker exec storage-test-minio mc mb --ignore-existing local/nuvix-storage-test
+
+# 2. Run the integration tests
+MINIO_TEST_URL=http://localhost:9000 bun run test:integration
+```
+
+These cover real S3 protocol behavior the offline suite can't: chunked upload assembly, abort cleanup, presigned GET/PUT round-trips, and cross-device transfers.
 
 ## Contributing
 

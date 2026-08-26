@@ -228,9 +228,26 @@ export class S3 extends Device {
 
   /**
    * Abort a chunked upload: remove any staged part objects.
+   * Throws FILE_NOT_FOUND when no staged parts exist.
    */
   async abort(path: string, _extra = ""): Promise<boolean> {
-    await this.deleteStagedPartsByPrefix(`${this.key(path)}${PART_SUFFIX}`);
+    const prefix = `${this.key(path)}${PART_SUFFIX}`;
+    const page = await this.client.list({ prefix, maxKeys: S3.MAX_PAGE_SIZE });
+    const staged = page.contents ?? [];
+
+    if (staged.length === 0) {
+      throw new StorageError(
+        "FILE_NOT_FOUND",
+        `No staged upload found for ${path}`,
+        path,
+      );
+    }
+
+    await Promise.all(
+      staged.map((object) =>
+        this.client.delete(object.key).catch(() => undefined),
+      ),
+    );
     return true;
   }
 
@@ -360,17 +377,6 @@ export class S3 extends Device {
     );
   }
 
-  /**
-   * List and delete all staged parts matching a prefix (used by `abort`).
-   */
-  private async deleteStagedPartsByPrefix(prefix: string): Promise<void> {
-    const page = await this.client.list({ prefix, maxKeys: S3.MAX_PAGE_SIZE });
-    await Promise.all(
-      (page.contents ?? []).map((object) =>
-        this.client.delete(object.key).catch(() => undefined),
-      ),
-    );
-  }
 }
 
 function errorMessage(error: unknown): string {
@@ -378,6 +384,17 @@ function errorMessage(error: unknown): string {
 }
 
 function isNotFound(error: unknown): boolean {
+  // Prefer the structured S3 error code when available (e.g. "NoSuchKey").
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && code.toLowerCase().includes("nosuchkey")) {
+    return true;
+  }
+  // Fall back to message matching: AWS says "NoSuchKey", MinIO and other
+  // S3-compatible servers say "The specified key does not exist."
   const message = errorMessage(error).toLowerCase();
-  return message.includes("404") || message.includes("nosuchkey");
+  return (
+    message.includes("404") ||
+    message.includes("nosuchkey") ||
+    message.includes("does not exist")
+  );
 }

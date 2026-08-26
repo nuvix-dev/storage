@@ -24,6 +24,7 @@
     "clean": "rm -rf dist",
     "prepublishOnly": "bun run clean && bun run build",
     "test": "bun test",
+    "test:integration": "bun test __tests__/integration",
     "test:watch": "bun test --watch",
     "test:coverage": "bun test --coverage",
     "lint": "oxlint src __tests__ index.ts",

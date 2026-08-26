@@ -11,6 +11,8 @@ This directory contains comprehensive tests for the Nuvix Storage library.
   - `local.test.ts` - Local file system storage tests
   - `s3.test.ts` - AWS S3 storage tests
   - `wasabi.test.ts` - Wasabi storage tests (S3-compatible)
+- `integration/` - Opt-in tests against a real MinIO server
+  - `minio.integration.test.ts` - Real S3 protocol behavior (chunked assembly, abort cleanup, presigned URLs, transfers)
 - `validator/` - Tests for file validation classes
   - `validator.test.ts` - Base validator class tests
   - `file.test.ts` - File validator tests
@@ -57,31 +59,34 @@ bun test validator/
 
 ## Test Configuration
 
-Tests use real implementations instead of mocks:
+The default suite is fully offline — cloud devices are exercised through offline-presign URL checks and config validation, so no credentials are ever needed.
 
-- **Local Device**: Uses temporary directories for file system operations
-- **Wasabi Device**: Can use real Wasabi credentials if provided via environment variables
-- **S3 Device**: Can use real AWS credentials if provided via environment variables
+### Integration Tests (opt-in)
 
-### Environment Variables for Real Cloud Tests
-
-To run tests against real Wasabi storage, set these environment variables:
+`__tests__/integration/` runs against a real MinIO server and is **skipped automatically** unless `MINIO_TEST_URL` is set:
 
 ```bash
-export WASABI_ACCESS_KEY="your-access-key"
-export WASABI_SECRET_KEY="your-secret-key"
-export WASABI_BUCKET="your-test-bucket"
+# Start MinIO and create the test bucket
+docker run -d --name storage-test-minio -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin-test \
+  minio/minio server /data --console-address ":9001"
+docker exec storage-test-minio mc alias set local http://localhost:9000 minioadmin minioadmin-test
+docker exec storage-test-minio mc mb --ignore-existing local/nuvix-storage-test
+
+# Run the integration tests
+MINIO_TEST_URL=http://localhost:9000 bun run test:integration
 ```
 
-To run tests against real AWS S3, set these environment variables:
+Environment variables:
 
-```bash
-export AWS_ACCESS_KEY="your-access-key"
-export AWS_SECRET_KEY="your-secret-key"
-export AWS_BUCKET="your-test-bucket"
-```
+| Variable | Default | Purpose |
+|---|---|---|
+| `MINIO_TEST_URL` | *(unset = skip)* | MinIO endpoint, e.g. `http://localhost:9000` |
+| `MINIO_TEST_USER` | `minioadmin` | Access key |
+| `MINIO_TEST_PASSWORD` | `minioadmin-test` | Secret key |
+| `MINIO_TEST_BUCKET` | `nuvix-storage-test` | Bucket name |
 
-**Note**: Some tests are marked as `skip` by default when real credentials are not provided to avoid unnecessary network calls and potential costs.
+These tests cover real S3 protocol behavior the offline suite cannot: chunked upload assembly (byte-exact), abort cleanup of staged parts, presigned GET/PUT round-trips via `fetch`, and cross-device transfers.
 
 ## Test Coverage
 
