@@ -28,7 +28,7 @@ bun add @nuvix/storage
 ```typescript
 import { Storage, Local } from "@nuvix/storage";
 
-const localStorage = new Local({ root: "./uploads" });
+const localStorage = new Local("./uploads");
 Storage.setDevice(Storage.DEVICE_LOCAL, localStorage);
 
 const device = Storage.getDevice(Storage.DEVICE_LOCAL);
@@ -45,7 +45,7 @@ console.log(await device.read("hello.txt")); // Buffer("Hello, World!")
 import { Local } from "@nuvix/storage";
 
 // Root defaults to the current working directory
-const device = new Local({ root: "./uploads" });
+const device = new Local("./uploads");
 
 await device.write("docs/report.pdf", buffer);
 await device.exists("docs/report.pdf"); // true
@@ -199,6 +199,8 @@ v2.0.0 is a breaking release:
 - **Fixed:** `S3.SA_EAST_1` now maps to `"sa-east-1"` (previously incorrectly mapped to `"eu-north-1"`).
 - **New:** `stat()`, `presign()`, `Storage.removeDevice()`, `Storage.listDevices()`, `move()`, `abort()`.
 
+See [MIGRATION.md](./MIGRATION.md) for the full step-by-step migration guide.
+
 ## Development
 
 ```bash
@@ -210,7 +212,7 @@ bun run typecheck    # tsc --noEmit
 bun run build        # bundle to dist/ (ESM + declarations)
 ```
 
-Tests that hit real cloud services stay skipped unless credentials are provided via environment variables (`AWS_*`, `WASABI_*`, `MINIO_*`).
+The test suite is fully offline — cloud devices are exercised through offline-presign URL checks and config validation, so no credentials are ever needed.
 
 ## Contributing
 
